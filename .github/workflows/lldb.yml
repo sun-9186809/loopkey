@@ -1,0 +1,108 @@
+name: Capture via lldb
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cap:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 1. 环境与准备
+        run: |
+          echo "=== arch ==="; uname -m; sw_vers
+          echo "=== sudo ==="; sudo -n true && echo "sudo OK" || echo "sudo NO"
+          echo "=== SIP ==="; csrutil status
+          echo "=== 解压 ==="
+          mkdir -p /tmp/kgrun
+          unzip -q keygen.zip -d /tmp/kgrun
+          APP=$(find /tmp/kgrun -maxdepth 2 -name "*.app" -type d | head -1)
+          echo "APP=$APP"
+          xattr -cr "$APP" 2>/dev/null || true
+          chmod +x "$APP"/Contents/MacOS/* 2>/dev/null || true
+          ls -la "$APP/Contents/MacOS/"
+          echo "APP_PATH=$APP" >> $GITHUB_ENV
+
+      - name: 2. 编译调用器
+        run: |
+          clang -dynamiclib -arch arm64 -framework Foundation -framework AppKit \
+            -O1 -o /tmp/cli.dylib kg_cli2.m 2>&1 | head -15
+          ls -la /tmp/cli.dylib && file /tmp/cli.dylib
+
+      - name: 3. 拿 IMP 与 slide（3 种方式）
+        run: |
+          cat > /tmp/addr.m <<'EOF'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          #import <mach-o/dyld.h>
+          __attribute__((constructor))
+          static void b(void){
+              for (uint32_t i=0;i<_dyld_image_count();i++){
+                  const char*n=_dyld_get_image_name(i);
+                  if(n && strstr(n,"CORE"))
+                      NSLog(@"[A] slide=0x%lx base=%p",(unsigned long)_dyld_get_image_vmaddr_slide(i),_dyld_get_image_header(i));
+              }
+              Class c=NSClassFromString(@"KGSerialNumberGenerator");
+              if(c){
+                  Method m=class_getInstanceMethod(c,@selector(createSerial:));
+                  if(m) NSLog(@"[A] IMP=%p",(void*)method_getImplementation(m));
+              }
+              exit(0);
+          }
+          EOF
+          clang -dynamiclib -arch arm64 -framework Foundation -O1 -o /tmp/addr.dylib /tmp/addr.m 2>&1 | head -5
+          BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
+          echo "--- 直接跑 ---"
+          DYLD_INSERT_LIBRARIES=/tmp/addr.dylib "$BIN" 2>&1 | grep '\[A\]' || echo "(none)"
+          echo "--- sudo 跑 ---"
+          sudo DYLD_INSERT_LIBRARIES=/tmp/addr.dylib "$BIN" 2>&1 | grep '\[A\]' || echo "(none)"
+          echo "--- lldb + disable-aslr ---"
+          sudo lldb -b \
+            -o "settings set target.env-vars DYLD_INSERT_LIBRARIES=/tmp/addr.dylib" \
+            -o "process launch --disable-aslr true" \
+            -- "$BIN" 2>&1 | grep -E '\[A\]|error' | head -10
+
+      - name: 4. lldb 下断点（--disable-aslr）
+        run: |
+          BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
+          cat > /tmp/lc.txt <<'EOF'
+          settings set target.env-vars DYLD_INSERT_LIBRARIES=/tmp/cli.dylib
+          settings set target.env-vars KG_NAME=ProbeMe
+          settings set target.env-vars KG_TAG=17
+          settings set target.env-vars KG_OUT=/tmp/kg_out.txt
+          breakpoint set -a 0x1000031bc
+          breakpoint set -a 0x100003424
+          breakpoint command add 1 -o "printf \"\n###HIT_ENTRY###\n\"" -o "register read x0 x1 x2" -o "continue"
+          breakpoint command add 2 -o "printf \"\n###HIT_SIGN###\n\"" -o "register read x0 x1 x2 x3 x4 x5 x6 x7 x19 x20 x21 x22" -o "memory read --size 1 --format x --count 32 $x0" -o "memory read --size 1 --format x --count 32 $x2" -o "continue"
+          process launch --disable-aslr true
+          quit
+          EOF
+          echo "=== lldb 输出 ==="
+          sudo lldb -b -s /tmp/lc.txt -- "$BIN" 2>&1 | grep -E '###HIT|Breakpoint [0-9]|error|exited|x[0-9]+ =|^ *0x' | head -80
+          echo ""
+          echo "=== 生成的码 ==="
+          cat /tmp/kg_out.txt 2>/dev/null || echo "(none)"
+
+      - name: 5. 备用：attach 到运行中的进程
+        if: always()
+        run: |
+          BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
+          echo "=== 后台启动 + sudo lldb attach ==="
+          DYLD_INSERT_LIBRARIES=/tmp/cli.dylib "$BIN" > /tmp/bg.log 2>&1 &
+          BGPID=$!
+          sleep 3
+          echo "PID=$BGPID"
+          sudo lldb -b -p $BGPID \
+            -o "register read x0 x1 x2" \
+            -o "detach" 2>&1 | head -30
+          kill -9 $BGPID 2>/dev/null || true
+          echo "=== 该进程日志 ==="
+          grep -E '\[KG\]|HIT' /tmp/bg.log | head -20 || echo "(none)"
+
+      - name: 6. 汇总
+        if: always()
+        run: |
+          echo "========== 汇总 =========="
+          cat /tmp/kg_out.txt 2>/dev/null || true
+          grep -E 'HIT|a0=|IMP|slide' /tmp/*.log 2>/dev/null | head -30 || true
