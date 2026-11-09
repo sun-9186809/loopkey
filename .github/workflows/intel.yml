@@ -1,0 +1,102 @@
+name: Capture Intel macos-13
+
+on:
+  workflow_dispatch:
+
+jobs:
+  intel-cap:
+    # macos-13 = Intel x86_64，排队很久但排上就能成功
+    runs-on: macos-13
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 1. 环境
+        run: |
+          echo "=== 架构（必须是 x86_64）==="
+          uname -m
+          sw_vers
+          sysctl -n machdep.cpu.brand_string
+          echo "=== 权限 ==="
+          sudo -n true && echo "sudo OK"
+          csrutil status
+          echo "=== 代码页可写性测试（Intel 上应该成功）==="
+          cat > /tmp/mp.c <<'EOF'
+          #include <stdio.h>
+          #include <sys/mman.h>
+          #include <errno.h>
+          #include <string.h>
+          #include <mach-o/dyld.h>
+          #include <mach/mach.h>
+          int main(void){
+              const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(0);
+              vm_address_t page = ((vm_address_t)h + 0x1000) & ~0xFFFUL;
+              kern_return_t kr = vm_protect(mach_task_self(), page, 4096, 0,
+                                            VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE);
+              printf("vm_protect kr=%d (%s)\n", kr, mach_error_string(kr));
+              int r = mprotect((void*)page, 4096, PROT_READ|PROT_WRITE|PROT_EXEC);
+              printf("mprotect=%d errno=%d (%s)\n", r, errno, strerror(errno));
+              return 0;
+          }
+          EOF
+          clang -o /tmp/mp /tmp/mp.c && /tmp/mp
+
+      - name: 2. 解压 + 编译
+        run: |
+          mkdir -p /tmp/kgrun
+          unzip -q keygen.zip -d /tmp/kgrun
+          APP=$(find /tmp/kgrun -maxdepth 2 -name "*.app" -type d | head -1)
+          xattr -cr "$APP" 2>/dev/null || true
+          chmod +x "$APP"/Contents/MacOS/* 2>/dev/null || true
+          echo "APP_PATH=$APP" >> $GITHUB_ENV
+          lipo -info "$APP/Contents/MacOS/"*
+          echo "=== 编译 x86_64 采集器 ==="
+          clang -dynamiclib -arch x86_64 -framework Foundation -framework AppKit \
+            -O1 -D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE \
+            -o /tmp/trap.dylib kg_trap2.m 2>&1 | head -20
+          ls -la /tmp/trap.dylib && file /tmp/trap.dylib
+          echo "=== 编译调用器 ==="
+          clang -dynamiclib -arch x86_64 -framework Foundation -framework AppKit \
+            -O1 -o /tmp/cli.dylib kg_cli2.m 2>&1 | head -10
+          ls -la /tmp/cli.dylib
+
+      - name: 3. SIGTRAP 方式（Intel 上 mprotect 应该能过）
+        run: |
+          LOG=/tmp/kg.log
+          BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
+          DYLD_INSERT_LIBRARIES=/tmp/trap.dylib "$BIN" > "$LOG" 2>&1 &
+          PID=$!
+          for i in $(seq 1 40); do sleep 1; kill -0 $PID 2>/dev/null || break; done
+          kill -9 $PID 2>/dev/null || true
+          echo "=== [KG] ==="
+          grep -E '\[KG\]|HIT|RESULT' "$LOG" || echo "(none)"
+          echo "=== full ==="
+          head -80 "$LOG"
+
+      - name: 4. lldb 方式（备用）
+        if: always()
+        run: |
+          BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
+          cat > /tmp/lc.txt <<'EOF'
+          settings set target.env-vars DYLD_INSERT_LIBRARIES=/tmp/cli.dylib
+          settings set target.env-vars KG_NAME=ProbeMe
+          settings set target.env-vars KG_TAG=17
+          settings set target.env-vars KG_OUT=/tmp/kg_out.txt
+          breakpoint set -a 0x100003424
+          breakpoint command add 1 -o "printf \"\n###HIT###\n\"" -o "register read rdi rsi rdx rcx r8 r9" -o "memory read --size 1 --format x --count 32 $rdi" -o "memory read --size 1 --format x --count 32 $rdx" -o "continue"
+          process launch --disable-aslr true
+          quit
+          EOF
+          echo "=== lldb x86_64 ==="
+          sudo lldb -b -s /tmp/lc.txt -- "$BIN" 2>&1 | grep -E '###HIT|Breakpoint|error|exited|rdi|rsi|rdx|^ *0x' | head -60
+          echo ""
+          cat /tmp/kg_out.txt 2>/dev/null || echo "(none)"
+
+      - name: 5. 汇总
+        if: always()
+        run: |
+          echo "========== 结果 =========="
+          grep -E 'HIT|a[0-5]=|rdi|rsi|RESULT|>>>|IMP|slide' /tmp/*.log 2>/dev/null | head -40 || true
+          echo "========== 生成码 =========="
+          cat /tmp/kg_out.txt 2>/dev/null || true
