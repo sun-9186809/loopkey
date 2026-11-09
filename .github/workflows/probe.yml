@@ -1,0 +1,22 @@
+name: Probe Runners
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14, macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Probe
+        run: |
+          echo "=== RUNNER: ${{ matrix.os }} ==="
+          uname -m
+          sw_vers
+          sysctl -n machdep.cpu.brand_string 2>/dev/null || true
+          sudo -n true && echo "sudo OK" || echo "sudo NO"
+          csrutil status 2>&1 || true
+          which lldb clang python3 unzip
