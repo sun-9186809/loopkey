@@ -5,8 +5,9 @@ on:
 
 jobs:
   capture:
-    # macos-13 = Intel x86_64，没有 M 系列的 W^X 限制
-    runs-on: macos-13
+    # macos-14 = Apple Silicon (M1/arm64)
+    # 真机 M1 有 SPTM 硬件保护，但 GitHub 的虚拟化环境可能不同，值得一试
+    runs-on: macos-14
 
     steps:
       - name: Checkout
@@ -16,81 +17,114 @@ jobs:
         run: |
           echo "=== 架构 ==="
           uname -m
+          uname -a
           sw_vers
+          sysctl -n machdep.cpu.brand_string 2>/dev/null || true
           echo "=== 工具 ==="
           which lldb clang python3 unzip
-          lldb --version 2>&1 | head -2
+          lldb --version 2>&1 | head -3
           echo "=== sudo ==="
-          sudo -n true && echo "sudo 免密可用 YES" || echo "sudo 需要密码"
+          sudo -n true && echo "sudo OK" || echo "sudo needs password"
           echo "=== SIP ==="
-          csrutil status
-          echo "=== 仓库文件 ==="
+          csrutil status 2>&1 || true
+          echo "=== VM 检测 ==="
+          sysctl -n kern.hv_vmm_present 2>/dev/null || echo "n/a"
+          ioreg -l 2>/dev/null | grep -i "virtual" | head -3 || true
+          echo "=== 仓库 ==="
           ls -la
 
       - name: 2. 解压 keygen
         run: |
           mkdir -p /tmp/kgrun
-          if [ -f keygen.zip ]; then
-            unzip -q keygen.zip -d /tmp/kgrun
-          else
-            echo "::error::找不到 keygen.zip"
-            exit 1
-          fi
+          unzip -q keygen.zip -d /tmp/kgrun
           APP=$(find /tmp/kgrun -maxdepth 2 -name "*.app" -type d | head -1)
           echo "APP = $APP"
-          if [ -z "$APP" ]; then
-            echo "::error::解压后没有 .app"
-            ls -laR /tmp/kgrun | head -30
-            exit 1
-          fi
+          if [ -z "$APP" ]; then echo "::error::no .app"; exit 1; fi
           xattr -cr "$APP" 2>/dev/null || true
           chmod +x "$APP"/Contents/MacOS/* 2>/dev/null || true
-          echo "=== 可执行文件 ==="
+          echo "=== 二进制架构 ==="
+          lipo -info "$APP/Contents/MacOS/"* 2>&1 || file "$APP/Contents/MacOS/"*
           ls -la "$APP/Contents/MacOS/"
-          file "$APP/Contents/MacOS/"*
           echo "APP_PATH=$APP" >> $GITHUB_ENV
 
-      - name: 3. 编译采集器
+      - name: 3a. 编译 arm64 采集器
         run: |
           cp kg_trap2.m /tmp/kg_trap2.m
-          echo "=== 编译 ==="
+          echo "=== arm64 编译 ==="
+          clang -dynamiclib -arch arm64 \
+            -framework Foundation -framework AppKit \
+            -O1 -D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE \
+            -o /tmp/kg_trap_arm64.dylib /tmp/kg_trap2.m 2>&1 | head -30
+          if [ -f /tmp/kg_trap_arm64.dylib ]; then
+            echo "OK $(stat -f%z /tmp/kg_trap_arm64.dylib) bytes"
+            file /tmp/kg_trap_arm64.dylib
+          else
+            echo "::warning::arm64 编译失败"
+          fi
+
+      - name: 3b. 编译 x86_64 采集器（备用）
+        run: |
           clang -dynamiclib -arch x86_64 \
             -framework Foundation -framework AppKit \
             -O1 -D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE \
-            -o /tmp/kg_trap.dylib /tmp/kg_trap2.m 2>&1 | head -30
-          if [ -f /tmp/kg_trap.dylib ]; then
-            echo "编译成功 $(stat -f%z /tmp/kg_trap.dylib) bytes"
-            file /tmp/kg_trap.dylib
+            -o /tmp/kg_trap_x86.dylib /tmp/kg_trap2.m 2>&1 | head -30
+          if [ -f /tmp/kg_trap_x86.dylib ]; then
+            echo "OK $(stat -f%z /tmp/kg_trap_x86.dylib) bytes"
           else
-            echo "::error::编译失败"
-            exit 1
+            echo "::warning::x86_64 编译失败"
           fi
 
-      - name: 4. 运行并抓参数
+      - name: 4. 运行 arm64 版本
         run: |
-          LOG=/tmp/kg.log
-          rm -f "$LOG"
+          LOG=/tmp/kg_arm.log
           BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
-          ls -la "$APP_PATH/Contents/MacOS/"
-          echo "=== 启动 ==="
-          DYLD_INSERT_LIBRARIES=/tmp/kg_trap.dylib "$BIN" > "$LOG" 2>&1 &
+          rm -f "$LOG"
+          echo "=== 启动 (arm64 dylib) ==="
+          DYLD_INSERT_LIBRARIES=/tmp/kg_trap_arm64.dylib "$BIN" > "$LOG" 2>&1 &
           PID=$!
           echo "PID=$PID"
-          for i in $(seq 1 45); do
+          for i in $(seq 1 30); do
             sleep 1
-            kill -0 $PID 2>/dev/null || { echo "进程已退出 (${i}s)"; break; }
+            kill -0 $PID 2>/dev/null || { echo "退出 (${i}s)"; break; }
           done
           kill -9 $PID 2>/dev/null || true
           echo ""
           echo "=== [KG] 输出 ==="
-          grep -E '\[KG\]|\[M\]|\[ADDR\]|HIT' "$LOG" || echo "(无匹配)"
+          grep -E '\[KG\]|HIT|RESULT' "$LOG" || echo "(无)"
           echo ""
-          echo "=== 全部日志（前 120 行）==="
-          head -120 "$LOG"
+          echo "=== 全部日志 ==="
+          head -100 "$LOG"
 
-      - name: 5. 提取 IMP 地址（备用）
+      - name: 5. 运行 x86_64 版本（Rosetta）
         if: always()
         run: |
+          LOG=/tmp/kg_x86.log
+          BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
+          rm -f "$LOG"
+          echo "=== 启动 (x86_64 dylib + Rosetta) ==="
+          arch -x86_64 env DYLD_INSERT_LIBRARIES=/tmp/kg_trap_x86.dylib "$BIN" > "$LOG" 2>&1 &
+          PID=$!
+          for i in $(seq 1 30); do
+            sleep 1
+            kill -0 $PID 2>/dev/null || { echo "退出 (${i}s)"; break; }
+          done
+          kill -9 $PID 2>/dev/null || true
+          echo ""
+          echo "=== [KG] 输出 ==="
+          grep -E '\[KG\]|HIT|RESULT' "$LOG" || echo "(无)"
+          echo ""
+          head -60 "$LOG"
+
+      - name: 6. 尝试关闭 SIP（如果有权限）
+        if: always()
+        run: |
+          echo "=== 尝试 csrutil disable ==="
+          sudo csrutil disable 2>&1 | head -5 || echo "无法关闭 SIP（正常，需要恢复模式）"
+
+      - name: 7. lldb 直连尝试
+        if: always()
+        run: |
+          BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
           cat > /tmp/cap.m <<'MEOF'
           #import <Foundation/Foundation.h>
           #import <objc/runtime.h>
@@ -100,39 +134,32 @@ jobs:
               for (uint32_t i=0;i<_dyld_image_count();i++){
                   const char*n=_dyld_get_image_name(i);
                   if(n && strstr(n,"CORE")){
-                      NSLog(@"[ADDR] img=%s slide=0x%lx base=%p", n,
-                            (unsigned long)_dyld_get_image_vmaddr_slide(i),
-                            _dyld_get_image_header(i));
+                      NSLog(@"[ADDR] slide=0x%lx base=%p",(unsigned long)_dyld_get_image_vmaddr_slide(i),_dyld_get_image_header(i));
                   }
               }
               Class c=NSClassFromString(@"KGSerialNumberGenerator");
               if(c){
                   Method m=class_getInstanceMethod(c,@selector(createSerial:));
-                  if(m) NSLog(@"[ADDR] IMP=%p", (void*)method_getImplementation(m));
-                  else NSLog(@"[ADDR] method not found");
-              } else {
-                  NSLog(@"[ADDR] class not found");
+                  if(m) NSLog(@"[ADDR] IMP=%p",(void*)method_getImplementation(m));
               }
               exit(0);
           }
           MEOF
-          clang -dynamiclib -arch x86_64 -framework Foundation -O1 -o /tmp/cap.dylib /tmp/cap.m 2>&1 | head -10
+          clang -dynamiclib -framework Foundation -O1 -o /tmp/cap.dylib /tmp/cap.m 2>&1 | head -10
           if [ -f /tmp/cap.dylib ]; then
-            DYLD_INSERT_LIBRARIES=/tmp/cap.dylib "$APP_PATH/Contents/MacOS/CORE Keygen" 2>&1 | grep -E 'ADDR|error' | head -10
+            DYLD_INSERT_LIBRARIES=/tmp/cap.dylib "$BIN" 2>&1 | grep -E 'ADDR|error' | head -10
           fi
 
-      - name: 6. 最终摘要
+      - name: 8. 最终摘要
         if: always()
         run: |
           echo "======================================"
-          echo "           最终结果"
+          echo "           结果汇总"
           echo "======================================"
-          if [ -f /tmp/kg.log ]; then
-            grep -E 'HIT|a0=|a1=|a2=|a3=|a4=|a5=|\*a|RESULT|>>>' /tmp/kg.log | head -50 || echo "(没有抓到寄存器)"
-            echo ""
-            echo "--- 生成结果 ---"
-            grep -E '>>>|RESULT' /tmp/kg.log | head -5
-          else
-            echo "(没有日志文件)"
-          fi
+          for f in /tmp/kg_arm.log /tmp/kg_x86.log; do
+            if [ -f "$f" ]; then
+              echo "--- $f ---"
+              grep -E 'HIT|a0=|a1=|a2=|a3=|RESULT|>>>' "$f" | head -30 || echo "(无匹配)"
+            fi
+          done
           echo "======================================"
