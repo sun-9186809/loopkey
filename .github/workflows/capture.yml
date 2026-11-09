@@ -1,0 +1,138 @@
+name: Capture Farrago Signing Params
+
+on:
+  workflow_dispatch:
+
+jobs:
+  capture:
+    # macos-13 = Intel x86_64，没有 M 系列的 W^X 限制
+    runs-on: macos-13
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 1. 环境确认
+        run: |
+          echo "=== 架构 ==="
+          uname -m
+          sw_vers
+          echo "=== 工具 ==="
+          which lldb clang python3 unzip
+          lldb --version 2>&1 | head -2
+          echo "=== sudo ==="
+          sudo -n true && echo "sudo 免密可用 YES" || echo "sudo 需要密码"
+          echo "=== SIP ==="
+          csrutil status
+          echo "=== 仓库文件 ==="
+          ls -la
+
+      - name: 2. 解压 keygen
+        run: |
+          mkdir -p /tmp/kgrun
+          if [ -f keygen.zip ]; then
+            unzip -q keygen.zip -d /tmp/kgrun
+          else
+            echo "::error::找不到 keygen.zip"
+            exit 1
+          fi
+          APP=$(find /tmp/kgrun -maxdepth 2 -name "*.app" -type d | head -1)
+          echo "APP = $APP"
+          if [ -z "$APP" ]; then
+            echo "::error::解压后没有 .app"
+            ls -laR /tmp/kgrun | head -30
+            exit 1
+          fi
+          xattr -cr "$APP" 2>/dev/null || true
+          chmod +x "$APP"/Contents/MacOS/* 2>/dev/null || true
+          echo "=== 可执行文件 ==="
+          ls -la "$APP/Contents/MacOS/"
+          file "$APP/Contents/MacOS/"*
+          echo "APP_PATH=$APP" >> $GITHUB_ENV
+
+      - name: 3. 编译采集器
+        run: |
+          cp kg_trap2.m /tmp/kg_trap2.m
+          echo "=== 编译 ==="
+          clang -dynamiclib -arch x86_64 \
+            -framework Foundation -framework AppKit \
+            -O1 -D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE \
+            -o /tmp/kg_trap.dylib /tmp/kg_trap2.m 2>&1 | head -30
+          if [ -f /tmp/kg_trap.dylib ]; then
+            echo "编译成功 $(stat -f%z /tmp/kg_trap.dylib) bytes"
+            file /tmp/kg_trap.dylib
+          else
+            echo "::error::编译失败"
+            exit 1
+          fi
+
+      - name: 4. 运行并抓参数
+        run: |
+          LOG=/tmp/kg.log
+          rm -f "$LOG"
+          BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
+          ls -la "$APP_PATH/Contents/MacOS/"
+          echo "=== 启动 ==="
+          DYLD_INSERT_LIBRARIES=/tmp/kg_trap.dylib "$BIN" > "$LOG" 2>&1 &
+          PID=$!
+          echo "PID=$PID"
+          for i in $(seq 1 45); do
+            sleep 1
+            kill -0 $PID 2>/dev/null || { echo "进程已退出 (${i}s)"; break; }
+          done
+          kill -9 $PID 2>/dev/null || true
+          echo ""
+          echo "=== [KG] 输出 ==="
+          grep -E '\[KG\]|\[M\]|\[ADDR\]|HIT' "$LOG" || echo "(无匹配)"
+          echo ""
+          echo "=== 全部日志（前 120 行）==="
+          head -120 "$LOG"
+
+      - name: 5. 提取 IMP 地址（备用）
+        if: always()
+        run: |
+          cat > /tmp/cap.m <<'MEOF'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          #import <mach-o/dyld.h>
+          __attribute__((constructor))
+          static void b(void){
+              for (uint32_t i=0;i<_dyld_image_count();i++){
+                  const char*n=_dyld_get_image_name(i);
+                  if(n && strstr(n,"CORE")){
+                      NSLog(@"[ADDR] img=%s slide=0x%lx base=%p", n,
+                            (unsigned long)_dyld_get_image_vmaddr_slide(i),
+                            _dyld_get_image_header(i));
+                  }
+              }
+              Class c=NSClassFromString(@"KGSerialNumberGenerator");
+              if(c){
+                  Method m=class_getInstanceMethod(c,@selector(createSerial:));
+                  if(m) NSLog(@"[ADDR] IMP=%p", (void*)method_getImplementation(m));
+                  else NSLog(@"[ADDR] method not found");
+              } else {
+                  NSLog(@"[ADDR] class not found");
+              }
+              exit(0);
+          }
+          MEOF
+          clang -dynamiclib -arch x86_64 -framework Foundation -O1 -o /tmp/cap.dylib /tmp/cap.m 2>&1 | head -10
+          if [ -f /tmp/cap.dylib ]; then
+            DYLD_INSERT_LIBRARIES=/tmp/cap.dylib "$APP_PATH/Contents/MacOS/CORE Keygen" 2>&1 | grep -E 'ADDR|error' | head -10
+          fi
+
+      - name: 6. 最终摘要
+        if: always()
+        run: |
+          echo "======================================"
+          echo "           最终结果"
+          echo "======================================"
+          if [ -f /tmp/kg.log ]; then
+            grep -E 'HIT|a0=|a1=|a2=|a3=|a4=|a5=|\*a|RESULT|>>>' /tmp/kg.log | head -50 || echo "(没有抓到寄存器)"
+            echo ""
+            echo "--- 生成结果 ---"
+            grep -E '>>>|RESULT' /tmp/kg.log | head -5
+          else
+            echo "(没有日志文件)"
+          fi
+          echo "======================================"
