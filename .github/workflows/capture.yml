@@ -5,161 +5,97 @@ on:
 
 jobs:
   capture:
-    # macos-14 = Apple Silicon (M1/arm64)
-    # 真机 M1 有 SPTM 硬件保护，但 GitHub 的虚拟化环境可能不同，值得一试
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 1. 环境确认
+      - name: 1. 环境
         run: |
-          echo "=== 架构 ==="
-          uname -m
-          uname -a
-          sw_vers
-          sysctl -n machdep.cpu.brand_string 2>/dev/null || true
-          echo "=== 工具 ==="
-          which lldb clang python3 unzip
-          lldb --version 2>&1 | head -3
-          echo "=== sudo ==="
-          sudo -n true && echo "sudo OK" || echo "sudo needs password"
-          echo "=== SIP ==="
-          csrutil status 2>&1 || true
-          echo "=== VM 检测 ==="
-          sysctl -n kern.hv_vmm_present 2>/dev/null || echo "n/a"
-          ioreg -l 2>/dev/null | grep -i "virtual" | head -3 || true
-          echo "=== 仓库 ==="
-          ls -la
+          echo "=== arch ==="; uname -m; sw_vers
+          echo "=== tools ==="; which lldb clang python3 unzip
+          echo "=== sudo ==="; sudo -n true && echo "sudo OK" || echo "sudo NO"
+          echo "=== SIP ==="; csrutil status 2>&1 || true
+          echo "=== VM ==="; sysctl -n kern.hv_vmm_present 2>/dev/null || true
+          echo "=== files ==="; ls -la
 
-      - name: 2. 解压 keygen
+      - name: 2. 解压
         run: |
           mkdir -p /tmp/kgrun
           unzip -q keygen.zip -d /tmp/kgrun
           APP=$(find /tmp/kgrun -maxdepth 2 -name "*.app" -type d | head -1)
-          echo "APP = $APP"
-          if [ -z "$APP" ]; then echo "::error::no .app"; exit 1; fi
+          echo "APP=$APP"
+          [ -z "$APP" ] && { echo "::error::no app"; exit 1; }
           xattr -cr "$APP" 2>/dev/null || true
           chmod +x "$APP"/Contents/MacOS/* 2>/dev/null || true
-          echo "=== 二进制架构 ==="
           lipo -info "$APP/Contents/MacOS/"* 2>&1 || file "$APP/Contents/MacOS/"*
-          ls -la "$APP/Contents/MacOS/"
           echo "APP_PATH=$APP" >> $GITHUB_ENV
 
-      - name: 3a. 编译 arm64 采集器
+      - name: 3. 编译 arm64
         run: |
           cp kg_trap2.m /tmp/kg_trap2.m
-          echo "=== arm64 编译 ==="
-          clang -dynamiclib -arch arm64 \
-            -framework Foundation -framework AppKit \
+          clang -dynamiclib -arch arm64 -framework Foundation -framework AppKit \
             -O1 -D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE \
-            -o /tmp/kg_trap_arm64.dylib /tmp/kg_trap2.m 2>&1 | head -30
-          if [ -f /tmp/kg_trap_arm64.dylib ]; then
-            echo "OK $(stat -f%z /tmp/kg_trap_arm64.dylib) bytes"
-            file /tmp/kg_trap_arm64.dylib
-          else
-            echo "::warning::arm64 编译失败"
-          fi
+            -o /tmp/trap.dylib /tmp/kg_trap2.m 2>&1 | head -20
+          ls -la /tmp/trap.dylib 2>/dev/null && file /tmp/trap.dylib
 
-      - name: 3b. 编译 x86_64 采集器（备用）
+      - name: 4. 验证能否 patch 代码页
         run: |
-          clang -dynamiclib -arch x86_64 \
-            -framework Foundation -framework AppKit \
-            -O1 -D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE \
-            -o /tmp/kg_trap_x86.dylib /tmp/kg_trap2.m 2>&1 | head -30
-          if [ -f /tmp/kg_trap_x86.dylib ]; then
-            echo "OK $(stat -f%z /tmp/kg_trap_x86.dylib) bytes"
-          else
-            echo "::warning::x86_64 编译失败"
-          fi
-
-      - name: 4. 运行 arm64 版本
-        run: |
-          LOG=/tmp/kg_arm.log
-          BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
-          rm -f "$LOG"
-          echo "=== 启动 (arm64 dylib) ==="
-          DYLD_INSERT_LIBRARIES=/tmp/kg_trap_arm64.dylib "$BIN" > "$LOG" 2>&1 &
-          PID=$!
-          echo "PID=$PID"
-          for i in $(seq 1 30); do
-            sleep 1
-            kill -0 $PID 2>/dev/null || { echo "退出 (${i}s)"; break; }
-          done
-          kill -9 $PID 2>/dev/null || true
-          echo ""
-          echo "=== [KG] 输出 ==="
-          grep -E '\[KG\]|HIT|RESULT' "$LOG" || echo "(无)"
-          echo ""
-          echo "=== 全部日志 ==="
-          head -100 "$LOG"
-
-      - name: 5. 运行 x86_64 版本（Rosetta）
-        if: always()
-        run: |
-          LOG=/tmp/kg_x86.log
-          BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
-          rm -f "$LOG"
-          echo "=== 启动 (x86_64 dylib + Rosetta) ==="
-          arch -x86_64 env DYLD_INSERT_LIBRARIES=/tmp/kg_trap_x86.dylib "$BIN" > "$LOG" 2>&1 &
-          PID=$!
-          for i in $(seq 1 30); do
-            sleep 1
-            kill -0 $PID 2>/dev/null || { echo "退出 (${i}s)"; break; }
-          done
-          kill -9 $PID 2>/dev/null || true
-          echo ""
-          echo "=== [KG] 输出 ==="
-          grep -E '\[KG\]|HIT|RESULT' "$LOG" || echo "(无)"
-          echo ""
-          head -60 "$LOG"
-
-      - name: 6. 尝试关闭 SIP（如果有权限）
-        if: always()
-        run: |
-          echo "=== 尝试 csrutil disable ==="
-          sudo csrutil disable 2>&1 | head -5 || echo "无法关闭 SIP（正常，需要恢复模式）"
-
-      - name: 7. lldb 直连尝试
-        if: always()
-        run: |
-          BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
-          cat > /tmp/cap.m <<'MEOF'
-          #import <Foundation/Foundation.h>
-          #import <objc/runtime.h>
-          #import <mach-o/dyld.h>
-          __attribute__((constructor))
-          static void b(void){
-              for (uint32_t i=0;i<_dyld_image_count();i++){
-                  const char*n=_dyld_get_image_name(i);
-                  if(n && strstr(n,"CORE")){
-                      NSLog(@"[ADDR] slide=0x%lx base=%p",(unsigned long)_dyld_get_image_vmaddr_slide(i),_dyld_get_image_header(i));
-                  }
-              }
-              Class c=NSClassFromString(@"KGSerialNumberGenerator");
-              if(c){
-                  Method m=class_getInstanceMethod(c,@selector(createSerial:));
-                  if(m) NSLog(@"[ADDR] IMP=%p",(void*)method_getImplementation(m));
-              }
-              exit(0);
+          cat > /tmp/mprot.c <<'EOF'
+          #include <stdio.h>
+          #include <sys/mman.h>
+          #include <errno.h>
+          #include <string.h>
+          #include <mach/mach.h>
+          int main(void) {
+              void *p = (void*)0x100000000UL;
+              vm_address_t page = (vm_address_t)p;
+              kern_return_t kr = vm_protect(mach_task_self(), page, 4096, 0,
+                                            VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE);
+              printf("vm_protect kr=%d (%s)\n", kr, mach_error_string(kr));
+              return 0;
           }
-          MEOF
-          clang -dynamiclib -framework Foundation -O1 -o /tmp/cap.dylib /tmp/cap.m 2>&1 | head -10
-          if [ -f /tmp/cap.dylib ]; then
-            DYLD_INSERT_LIBRARIES=/tmp/cap.dylib "$BIN" 2>&1 | grep -E 'ADDR|error' | head -10
-          fi
+          EOF
+          clang -o /tmp/mprot /tmp/mprot.c
+          /tmp/mprot 2>&1 | head -3
+          echo "--- 用真实模块测试 ---"
+          cat > /tmp/mprot2.c <<'EOF'
+          #include <stdio.h>
+          #include <sys/mman.h>
+          #include <errno.h>
+          #include <string.h>
+          #include <mach-o/dyld.h>
+          #include <mach/mach.h>
+          int main(void) {
+              const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(0);
+              void *text = (void*)((uintptr_t)h + 0x1000);
+              vm_address_t page = (vm_address_t)text & ~0xFFFUL;
+              kern_return_t kr = vm_protect(mach_task_self(), page, 4096, 0,
+                                            VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE);
+              printf("self __TEXT vm_protect kr=%d (%s)\n", kr, mach_error_string(kr));
+              int r = mprotect((void*)page, 4096, PROT_READ|PROT_WRITE|PROT_EXEC);
+              printf("self __TEXT mprotect=%d errno=%d (%s)\n", r, errno, strerror(errno));
+              return 0;
+          }
+          EOF
+          clang -o /tmp/mprot2 /tmp/mprot2.c 2>&1 | head -5
+          /tmp/mprot2 2>&1 | head -5
 
-      - name: 8. 最终摘要
+      - name: 5. 跑采集器
+        run: |
+          LOG=/tmp/kg.log
+          BIN="$APP_PATH/Contents/MacOS/CORE Keygen"
+          DYLD_INSERT_LIBRARIES=/tmp/trap.dylib "$BIN" > "$LOG" 2>&1 &
+          PID=$!
+          for i in $(seq 1 40); do sleep 1; kill -0 $PID 2>/dev/null || break; done
+          kill -9 $PID 2>/dev/null || true
+          echo "=== [KG] ==="
+          grep -E '\[KG\]|HIT|RESULT' "$LOG" || echo "(none)"
+          echo "=== full log ==="
+          head -80 "$LOG"
+
+      - name: 6. 摘要
         if: always()
         run: |
-          echo "======================================"
-          echo "           结果汇总"
-          echo "======================================"
-          for f in /tmp/kg_arm.log /tmp/kg_x86.log; do
-            if [ -f "$f" ]; then
-              echo "--- $f ---"
-              grep -E 'HIT|a0=|a1=|a2=|a3=|RESULT|>>>' "$f" | head -30 || echo "(无匹配)"
-            fi
-          done
-          echo "======================================"
+          echo "===== 结果 ====="
+          grep -E 'HIT|a0=|a1=|RESULT|>>>' /tmp/kg.log 2>/dev/null | head -30 || echo "(无)"
